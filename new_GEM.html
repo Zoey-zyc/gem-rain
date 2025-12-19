@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GEM Rain - Three.js & MediaPipe</title>
+    <!-- <style>
+        body { margin: 0; overflow: hidden; background-color: #050510; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-input { position: absolute; top: 10px; left: 10px; width: 160px; height: 120px; z-index: 2; transform: scaleX(-1); opacity: 0.5; border-radius: 8px; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-family: monospace; font-size: 24px; z-index: 10; pointer-events: none; }
+        .instruction { position: absolute; bottom: 20px; left: 20px; color: rgba(255,255,255,0.6); font-family: sans-serif; z-index: 2; pointer-events: none; }
+    </style> -->
+
+     <style>
+        body { margin: 0; overflow: hidden; background-color: #050510;font-family: sans-serif;  }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-input { position: absolute; top: 10px; left: 10px; width: 160px; height: 120px; z-index: 2; transform: scaleX(-1); opacity: 0.5; border-radius: 8px; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-family: monospace; font-size: 24px; z-index: 10; pointer-events: none; }
+        /* .instruction { position: absolute; bottom: 20px; left: 20px; color: rgba(255,255,255,0.6); font-family: sans-serif; z-index: 2; pointer-events: none; } */
+        /* UI 控件 */
+        #ui-layer {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.7);
+            background: rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+        }
+        input[type="file"] { margin-top: 10px; }
+        .status { margin-bottom: 5px; font-size: 14px; }
+        .instruction { font-size: 12px; color: #aaa; margin-top: 5px;}
+    </style>
+    
+    <!-- Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    
+    <!-- MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">LOADING SYSTEM...</div>
+    <div id="canvas-container"></div>
+    <video id="video-input"></video>
+    <video id="input-video"></video>
+    <div id="ui-layer">
+        <div>Upload BGM:</div>
+        <input type="file" id="audio-upload" accept="audio/*" style="display:none">
+        <button id="upload-btn" style="padding:6px 12px;font-size:14px;cursor:pointer">Choose File</button>
+        <span id="file-name" style="margin-left:8px;font-size:14px;color:#ccc">No file selected</span>
+        <audio id="bgm" loop></audio>
+        <div class="instruction">
+            🖐 Open Hand: Rain Falls | ✊ Fist: Stop & Float<br>
+            ↔️ Move Hand Away: Form "GEM" | ↕️ Move Hand: Camera Parallax
+        </div>
+    </div>
+
+    
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        // 引入表面采样器，用于均匀分布粒子
+        import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
+
+        // --- Configuration ---
+        const PARTICLE_COUNT = 20000; // 稍微增加粒子数量以获得更密实的效果
+        // const TEXT_STRING = "GEM";
+        const TEXT_STRING = "GEM";
+        const RAIN_RANGE_Y = 60;
+        const RAIN_RANGE_XZ = 80;
+
+        // --- Globals ---
+        let scene, camera, renderer;
+        let particleSystem;
+        let uniforms;
+        let handLandmarker;
+        let targetMorphFactor = 0; // 0 = Rain, 1 = GEM
+        let targetRainSpeed = 1.0;
+        let targetCameraPos = { x: 0, y: 0 };
+        
+        // --- Shaders ---
+        
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uSpeed;       // 0.0 (stop) to 2.0 (fast)
+            uniform float uMorphFactor; // 0.0 (rain) to 1.0 (text)
+            uniform float uRangeY;
+            
+            attribute vec3 aTargetPos;  // Position in GEM text
+            attribute float aSpeedOffset;
+            attribute float aSize;
+
+            varying float vVisible;
+            varying float vMorph;
+
+            void main() {
+                vMorph = uMorphFactor;
+
+                // --- Rain Logic ---
+                vec3 rainPos = position;
+                
+                float fallSpeed = (20.0 + aSpeedOffset * 10.0) * uSpeed;
+                float yOffset = mod(uTime * fallSpeed, uRangeY);
+                
+                rainPos.y -= yOffset;
+                
+                if(rainPos.y < -uRangeY/2.0) rainPos.y += uRangeY;
+
+                // Add slant (Wind effect)
+                rainPos.x += (rainPos.y + uRangeY/2.0) * 0.1; 
+
+                // --- Target Logic (GEM) ---
+                vec3 textPos = aTargetPos;
+
+                // --- Mixing ---
+                // 使用缓动函数让聚合过程更平滑
+                // smoothstep helps the particles snap to shape more organically
+                float smoothMorph = smoothstep(0.0, 1.0, uMorphFactor);
+                vec3 finalPos = mix(rainPos, textPos, smoothMorph);
+
+                // Add some floating noise when stopped (Fist mode) or fully formed
+                if(uSpeed < 0.1 || uMorphFactor > 0.8) {
+                    float noiseFreq = 2.0;
+                    float noiseAmp = 0.1;
+                    if(uMorphFactor > 0.8) { noiseAmp = 0.05; } // Less jitter when formed
+                    
+                    finalPos.x += sin(uTime * noiseFreq + position.y) * noiseAmp;
+                    finalPos.y += cos(uTime * noiseFreq + position.x) * noiseAmp;
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+
+                // Size attenuation
+                float currentSize = mix(aSize, aSize * 1.2, uMorphFactor);
+                gl_PointSize = currentSize * (300.0 / -mvPosition.z);
+                
+                vVisible = 1.0;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 uColor;
+            varying float vMorph;
+
+            void main() {
+                vec2 center = gl_PointCoord - 0.5;
+                float dist = length(center);
+                if (dist > 0.5) discard;
+
+                float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
+                
+                vec2 highlight = center - vec2(-0.1, 0.1);
+                float spec = 1.0 - smoothstep(0.0, 0.15, length(highlight));
+                
+                // Colors: Rain (Blue-ish) -> GEM (Cyan/Teal glowing)
+                vec3 rainColor = vec3(0.6, 0.7, 0.9);
+                vec3 gemColor = vec3(0.8, 0.2, 1.0); // 亮紫色
+                // vec3 gemColor = vec3(0.0, 1.0, 0.9); // 更鲜艳的青色
+                
+                vec3 finalColor = mix(rainColor, gemColor, vMorph);
+
+                // 增加一点发光感
+                gl_FragColor = vec4(finalColor + vec3(spec), alpha * (0.6 + vMorph * 0.4));
+            }
+        `;
+
+        // --- Initialization ---
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050510, 0.02);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 35; // 稍微拉远一点以便看到完整的GEM
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            // Load Font & Create Particles
+            const loader = new FontLoader();
+            loader.load('https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json', function (font) {
+                createParticleSystem(font);
+                document.getElementById('loading').style.display = 'none';
+                initMediaPipe();
+                animate();
+            });
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function createParticleSystem(font) {
+            // 1. Generate Text Geometry with Bevels (Roundness)
+            const textGeo = new TextGeometry(TEXT_STRING, {
+                font: font,
+                size: 10,
+                height: 3,           // 增加厚度
+                curveSegments: 24,   // 增加曲线分段，使圆弧更圆滑
+                bevelEnabled: true,  // 开启倒角
+                bevelThickness: 1,   // 倒角厚度
+                bevelSize: 0.5,      // 倒角延伸大小
+                bevelOffset: 0,
+                bevelSegments: 5     // 倒角分段数，越高越圆润
+            });
+            textGeo.center();
+
+            // 2. Use MeshSurfaceSampler to distribute points evenly
+            // 我们需要创建一个临时的 Mesh 来给 Sampler 使用
+            const textMaterial = new THREE.MeshBasicMaterial();
+            const textMesh = new THREE.Mesh(textGeo, textMaterial);
+            
+            // 创建采样器
+            const sampler = new MeshSurfaceSampler(textMesh).build();
+
+            // 3. Create BufferGeometry for Particles
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const targetPositions = [];
+            const speeds = [];
+            const sizes = [];
+
+            // 临时变量用于存储采样点
+            const tempPosition = new THREE.Vector3();
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // Initial Rain Position
+                positions.push(
+                    (Math.random() - 0.5) * RAIN_RANGE_XZ,
+                    (Math.random() - 0.5) * RAIN_RANGE_Y + 10,
+                    (Math.random() - 0.5) * RAIN_RANGE_XZ / 2
+                );
+
+                // Target Position: Sample randomly from the text surface!
+                // 这比直接取顶点要好得多，因为它可以覆盖整个表面
+                sampler.sample(tempPosition);
+                
+                targetPositions.push(
+                    tempPosition.x,
+                    tempPosition.y,
+                    tempPosition.z
+                );
+
+                speeds.push(Math.random());
+                sizes.push(Math.random() * 0.5 + 0.5);
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('aTargetPos', new THREE.Float32BufferAttribute(targetPositions, 3));
+            geometry.setAttribute('aSpeedOffset', new THREE.Float32BufferAttribute(speeds, 1));
+            geometry.setAttribute('aSize', new THREE.Float32BufferAttribute(sizes, 1));
+
+            // 4. Create Shader Material
+            uniforms = {
+                uTime: { value: 0 },
+                uSpeed: { value: 1.0 },
+                uMorphFactor: { value: 0.0 },
+                uRangeY: { value: RAIN_RANGE_Y },
+                uColor: { value: new THREE.Color(0xaaaaaa) }
+            };
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending
+            });
+
+            particleSystem = new THREE.Points(geometry, material);
+            scene.add(particleSystem);
+        }
+
+        // --- MediaPipe Logic ---
+
+        function initMediaPipe() {
+            const videoElement = document.getElementById('video-input');
+            
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onHandsResults);
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 320,
+                height: 240
+            });
+            cameraUtils.start();
+        }
+
+        function onHandsResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 1. Detect Open Hand vs Fist
+                const wrist = landmarks[0];
+                const tips = [8, 12, 16, 20];
+                let foldedFingers = 0;
+                
+                tips.forEach(idx => {
+                    const tip = landmarks[idx];
+                    const d = Math.sqrt(Math.pow(tip.x - wrist.x, 2) + Math.pow(tip.y - wrist.y, 2));
+                    if (d < 0.15) foldedFingers++; 
+                });
+
+                const isFist = foldedFingers >= 3;
+
+                if (isFist) {
+                    targetRainSpeed = 0.0; 
+                } else {
+                    targetRainSpeed = 1.0; 
+                }
+
+                // 2. Detect Distance
+                let minX = 1, maxX = 0, minY = 1, maxY = 0;
+                landmarks.forEach(lm => {
+                    if(lm.x < minX) minX = lm.x;
+                    if(lm.x > maxX) maxX = lm.x;
+                    if(lm.y < minY) minY = lm.y;
+                    if(lm.y > maxY) maxY = lm.y;
+                });
+                
+                const width = maxX - minX;
+                const height = maxY - minY;
+                const area = width * height;
+
+                // Mapping
+                let distanceFactor = 1.0 - Math.min(Math.max((area - 0.03) / (0.12 - 0.03), 0), 1);
+                targetMorphFactor = distanceFactor;
+
+                // 3. Parallax
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                
+                targetCameraPos.x = (centerX - 0.5) * -20; 
+                targetCameraPos.y = (centerY - 0.5) * -10;
+
+            } else {
+                targetRainSpeed = 1.0;
+                targetMorphFactor = 0.0;
+                targetCameraPos.x = 0;
+                targetCameraPos.y = 0;
+            }
+        }
+
+        // --- Animation Loop ---
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = 0.016;
+
+            if (uniforms) {
+                uniforms.uTime.value += dt;
+                uniforms.uSpeed.value += (targetRainSpeed - uniforms.uSpeed.value) * 0.1;
+                uniforms.uMorphFactor.value += (targetMorphFactor - uniforms.uMorphFactor.value) * 0.05;
+            }
+
+            camera.position.x += (targetCameraPos.x - camera.position.x) * 0.05;
+            camera.position.y += (targetCameraPos.y - camera.position.y) * 0.05;
+            camera.lookAt(0, 0, 0);
+
+            renderer.render(scene, camera);
+        }
+
+           // --- 5. 音频处理 ---
+      
+          function initAudio() {
+            const realInput = document.getElementById('audio-upload');
+            const btn       = document.getElementById('upload-btn');
+            const nameSpan  = document.getElementById('file-name');
+
+            btn.addEventListener('click', () => realInput.click());
+            realInput.addEventListener('change', function () {
+                const file = this.files[0];
+                if (file) {
+                    nameSpan.textContent = file.name;          // 显示文件名
+                    const url = URL.createObjectURL(file);
+                    document.getElementById('bgm').src = url;
+                    document.getElementById('bgm').play();
+                    statusText.innerText += " | Music playing";
+                } else {
+                    nameSpan.textContent = "No file selected"; // 重置提示
+                }
+            });
+        }
+        
+
+        // function initAudio() {
+        //     const upload = document.getElementById('audio-upload');
+        //     const audio = document.getElementById('bgm');
+            
+        //     upload.addEventListener('change', function(e) {
+        //         const file = e.target.files[0];
+        //         if (file) {
+        //             const objectUrl = URL.createObjectURL(file);
+        //             audio.src = objectUrl;
+        //             audio.play();
+        //             statusText.innerText += " | Music playing";   // 2. 音乐开始播放提示
+        //             // statusText.innerText += " | 音乐播放中";
+        //         }
+        //     });
+        // }
+
+
+        // Start
+        init();
+        initAudio();
+
+    </script>
+</body>
+</html>
